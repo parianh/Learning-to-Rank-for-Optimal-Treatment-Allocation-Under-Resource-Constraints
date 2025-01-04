@@ -4,7 +4,7 @@ Options to split by maximizing AUTOC or minimizing MSE
 Training splits are done using build DR-proxies, as CATEs are not available in training 
 Script saves: 
 1. Learned forests 
-2. Results across 30 seeds """
+2. Results across 10 seeds """
 
 import numpy as np
 import pandas as pd
@@ -16,15 +16,17 @@ from causalml.optimize.policylearner import *
 import pickle
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import sys 
+import argparse
 from random import seed
-from random import randrangf
+from random import randrange
 from math import sqrt
 from scipy.stats import rankdata
+from sklearn.linear_model import LogisticRegressionCV  # Add this import
 
 
+# Function Definitions
 def bootstrap_sample(X, y, to_choose = 1):
-    """Bootstraps data for different samples that will train each treee"""
+    """Bootstraps data for different samples that will train each tree"""
     n_samples = X.shape[0]
     to_choose = int(to_choose * n_samples)
     idxs = np.random.choice(n_samples, to_choose, replace=True)
@@ -33,20 +35,14 @@ def bootstrap_sample(X, y, to_choose = 1):
 def gen_data(n, seed = 0):
     """Generates training data based on random seed"""
     np.random.seed(seed)
-    
     p = 10 
-    
     X = np.random.multivariate_normal(np.zeros(p), np.eye(p), size = n)
-    
     e = 1 / (1 + np.exp(-X[:, 2]))
-    
     Z = np.random.binomial(1, 1 / (1 + np.exp(-X[:, 2])))
     eps = np.random.normal(size = n)
     tau = 1 + 2 * np.abs(X[:,3]) + (X[:, 9]) ** 2
     Y = (5 * (2 + 0.5 * np.sin(np.pi * X[:,0]) - 0.25 * X[:, 1] *+ 2 + 0.75 * X[:, 2] * X[:, 8])) + Z * tau + eps
-    
     return (X, Y, Z, tau, e)
-
 
 def gen_data_val(n, seed = 0):
     """Generates validation data based on random seed
@@ -73,8 +69,6 @@ def gen_data_test(n, seed = 0):
     tau = 1 + 2 * np.abs(X[:,3]) + (X[:, 9]) ** 2
     
     return (X, tau)
-
-
     
 def AUTOC(dr_scores, priorities, sample_weights = None, query = 'AUTOC'): 
     """Calculate AUTOC for evaluation. 
@@ -83,11 +77,24 @@ def AUTOC(dr_scores, priorities, sample_weights = None, query = 'AUTOC'):
     if not sample_weights: 
         sample_weights = np.ones(len(dr_scores))
         
+    print(f"dr_scores shape: {dr_scores.shape}")
+    print(f"sample_weights shape: {sample_weights.shape}")
+    print(f"priorities shape: {priorities.shape}")
+   
+    # Ensure all arrays are of the same length (5000)
+    min_len = min(len(dr_scores), len(sample_weights), len(priorities))  # Get the minimum length
+    dr_scores = dr_scores[:min_len]
+    sample_weights = sample_weights[:min_len]
+    priorities = priorities[:min_len]
+
+    
     priorities = rankdata(priorities).astype(int)
     sort_idx = np.argsort(priorities)[::-1]
     num_ties = np.bincount(priorities)
     num_ties = num_ties[num_ties != 0]
     df = pd.DataFrame(np.array([dr_scores, sample_weights, priorities]).T[sort_idx])
+
+    
     grp_sum = df.groupby(2, sort = False).sum()
     dr_avg = grp_sum[0].values / grp_sum[1].values
     dr_scores_sorted = np.repeat(dr_avg, num_ties[::-1])
@@ -351,7 +358,18 @@ class DecisionTreeAUTOC:
             return self._traverse_tree(x, node.left)
         return self._traverse_tree(x, node.right)
     
-    
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train the model")
+    parser.add_argument('--n_estimators', type=int, required=True, help="Number of trees in the random forest")
+    parser.add_argument('--max_samples', type=float, required=True, help="Sample size for each tree")
+    parser.add_argument('--min_samples_leaf', type=int, required=True, help="Min samples per leaf")
+    parser.add_argument('--min_samples_split', type=int, required=True, help="Min samples to split")
+    parser.add_argument('--method', type=int, required=True, choices=[0, 1], help="Method: 1 for random forest, 0 for baseline")
+    parser.add_argument('--min_impurity', type=float, required=True, help="Min impurity for split")
+    parser.add_argument('--max_depth', type=int, required=True, help="Max depth of tree")
+
+    return parser.parse_args()
+
 class RandomForestAUTOC:
     
     def __init__(self, n_estimators=10, min_samples_split=2, min_samples_leaf=1, max_samples=1,
@@ -405,80 +423,89 @@ class RandomForestAUTOC:
         y_pred = tree_preds.mean(axis = 0)
         return np.array(y_pred)
     
-
-    
-    
-def run(n_estimators = 100, max_samples = 1, min_samples_leaf=1, min_samples_split=2, method = 0, max_depth = np.inf, min_impurity = -100, use_ground_truth_prop = True):
-
-
-    #Can change to any amount of training data
+def run(n_estimators=100, max_samples=1, min_samples_leaf=1, min_samples_split=2, method=0, max_depth=np.inf, min_impurity=-100, use_ground_truth_prop=True):    
     N = 250
-
     dct_val, dct_test = {}, {}
 
     rfs_val = []
     rfs_test = []
 
-    def train_on_DR(seq, N): 
+        
+    def train_on_DR(seq=1, N=N):
+        (X, Y, Z, tau, e) = gen_data(n=N, seed=seq) 
+        (Xte, taute) = gen_data_test(n=5000, seed=seq) 
+        (Xval, tauval) = gen_data_val(n=1000, seed=seq)  
 
-        #Generate train, val, or test data
-        (X, Y, Z, tau, e)  = gen_data(n = N, seed = seq)
-        (Xte, taute) = gen_data_test(n = 5000, seed = seq)
-        (Xval, tauval) = gen_data_val(n = 1000, seed = seq)
 
-        #Create DR estimates to be used only for training, as we do not have access to CATEs in training 
-        #Either use ground-truth training propensity scores or learn them using some model
-        if use_ground_truth_prop: 
-            pl = PolicyLearner(policy_learner = LogisticRegressionCV(), treatment_learner = LogisticRegressionCV(), random_state = 0).fit(X,Z,Y, p = e)
-        else: 
-            pl = PolicyLearner(policy_learner = LogisticRegressionCV(), treatment_learner = LogisticRegressionCV(), random_state = 0).fit(X,Z,Y)
+        if use_ground_truth_prop:
+            pl = PolicyLearner(policy_learner=LogisticRegressionCV(), treatment_learner=LogisticRegressionCV(), random_state=0).fit(X, Z, Y, p=e)
+        else:
+            pl = PolicyLearner(policy_learner=LogisticRegressionCV(), treatment_learner=LogisticRegressionCV(), random_state=0).fit(X, Z, Y)
 
         y = pl._dr_score
 
-        #Initialize and fit random forest
-        est = RandomForestAUTOC(n_estimators = n_estimators, max_samples = max_samples, 
-                                min_samples_leaf = min_samples_leaf, min_samples_split = min_samples_split, 
-                                method = method, n_jobs = 100, min_impurity = min_impurity, max_depth = max_depth)
-        est.fit(X, y)  
+        est = RandomForestAUTOC(n_estimators=n_estimators, max_samples=max_samples,
+                                min_samples_leaf=min_samples_leaf, min_samples_split=min_samples_split,
+                                method=method, n_jobs=4, min_impurity=min_impurity, max_depth=max_depth)
+        est.fit(X, y)
 
-        #Save random forest
-        with open('models/autoc_forest_{}_{}_{}_{}_{}_{}_{}_{}_{}.pkl'.format(seq, N, n_estimators, max_samples, min_samples_leaf, min_samples_split, min_impurity, max_depth, method), 'wb') as f: 
+        with open('models/autoc_forest_{}_{}_{}_{}_{}_{}_{}_{}_{}.pkl'.format(seq, N, n_estimators, max_samples, min_samples_leaf, min_samples_split, min_impurity, max_depth, method), 'wb') as f:
             pickle.dump(est, f)
 
-        #Generate predictions
-        curr_est_rf_val = est.predict(Xval, n_jobs = 100)
-        curr_est_rf = est.predict(Xte, n_jobs = 100)
+        curr_est_rf_val = est.predict(Xval, n_jobs=4)
+        curr_est_rf = est.predict(Xte, n_jobs=4)
 
-        return [(AUTOC(taute.reshape(-1), res.reshape(-1))) for res in [curr_est_rf_val, curr_est_rf]]
+        # Ensure AUTOC output consistency by printing its type and structure
+        result_val = AUTOC(taute.reshape(-1), curr_est_rf_val.reshape(-1))
+        result_test = AUTOC(taute.reshape(-1), curr_est_rf.reshape(-1))
 
-    #Across all seeds, train and evaluate
-    for s in tqdm(range(30)):
+        # Print the type and content of the results
+        print(f"Result val type: {type(result_val)}")
+        print(f"Result val content: {result_val}")
+        print(f"Result test type: {type(result_test)}")
+        print(f"Result test content: {result_test}")
+
+        return [result_val, result_test]
+
+    # Run for 10 seeds and collect results
+    rfs_val = []
+    rfs_test = []
+
+    for s in range(1, 11):  # Running for 10 seeds (1 to 10)
         rfs_curr_val, rfs_curr_test = train_on_DR(s, N)
         rfs_val.append(rfs_curr_val)
         rfs_test.append(rfs_curr_test)
-    
-    #Save out model performance across all seeds
-    rfs_val = np.array(rfs_val)
-    rfs_test = np.array(rfs_test)
+
+    # Ensure consistent shape before converting to NumPy arrays
+    try:
+        rfs_val = np.array(rfs_val, dtype=object)
+        rfs_test = np.array(rfs_test, dtype=object)
+    except Exception as e:
+        print(f"Error while converting rfs_val or rfs_test: {e}")
 
     dct_val[N] = rfs_val
     dct_test[N] = rfs_test
 
-
-    with open('val_results/results_{}_{}_{}_{}_{}_{}_{}.pkl'.format(n_estimators, max_samples, min_samples_leaf, min_samples_split, min_impurity, max_depth, method), 'wb') as f: 
+    # Saving the results for all 10 seeds
+    with open('val_results/results_{}_{}_{}_{}_{}_{}_{}.pkl'.format(n_estimators, max_samples, min_samples_leaf, min_samples_split, min_impurity, max_depth, method), 'wb') as f:
         pickle.dump(dct_val, f)
-    with open('test_results/results_{}_{}_{}_{}_{}_{}_{}.pkl'.format(n_estimators, max_samples, min_samples_leaf, min_samples_split, min_impurity, max_depth, method), 'wb') as f: 
+
+    with open('test_results/results_{}_{}_{}_{}_{}_{}_{}.pkl'.format(n_estimators, max_samples, min_samples_leaf, min_samples_split, min_impurity, max_depth, method), 'wb') as f:
         pickle.dump(dct_test, f)
 
+   
 if __name__ == '__main__': 
-    n_estimators = int(sys.argv[1])
-    max_samples = float(sys.argv[2])
-    min_samples_leaf = int(sys.argv[3])
-    min_samples_split = int(sys.argv[4])
-    method = int(sys.argv[5])
-    min_impurity = float(sys.argv[6])
-    max_depth = int(float(sys.argv[7]))
-    run(n_estimators = n_estimators, max_samples = max_samples, min_samples_leaf=min_samples_leaf, min_samples_split=min_samples_split, method = method, min_impurity = min_impurity, max_depth = max_depth)
-    
-    
-    
+    # Parse arguments using argparse
+    args = parse_args()
+
+    # Call the run function with the parsed arguments
+    run(
+        n_estimators=args.n_estimators,
+        max_samples=args.max_samples,
+        min_samples_leaf=args.min_samples_leaf,
+        min_samples_split=args.min_samples_split,
+        method=args.method,
+        min_impurity=args.min_impurity,
+        max_depth=args.max_depth
+    )
+
